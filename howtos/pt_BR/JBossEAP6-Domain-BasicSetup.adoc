@@ -1,0 +1,954 @@
+﻿
+= Implementando um ambiente Red Hat JBoss EAP 6 (Domain Mode) com Monitoramento e Gerência (JBoss ON)
+Autor <rsoares@redhat.com	>
+v1.0, 19/01/2015
+:toc: right
+:source-highlighter: pygments
+:icons: font
+
+Este documento serve como um guia para instalação e configuração de um [underline]#ambiente básico#
+JBoss EAP 6.x em modo _Domain_ em um ambiente Red Hat Enterprise Linux.
+
+WARNING: este ambiente costuma ser implementado apenas como Prova de Conceito.
+Caso queira utilizar como referência para um ambiente diferente,
+realize as devidas adaptações conforme julgar necessário considerando o _workload_ esperado para o seu ambiente!
+
+O documento tem por objetivo ser um roteiro simples e direto. Sem rodeios!
+
+NOTE: este documento não substitui a documentação oficial do produto
+*_JBoss Enterprise Application Platform_* mantida pelo fornecedor Red Hat.
+Para mais detalhes consulte a documentação oficial disponível em
+https://access.redhat.com/documentation
+
+== Ambiente de Referência
+
+=== Máquinas Virtuais
+O ambiente proposto neste documento utiliza 4 máquinas virtuais com
+sistema operacional Linux 64bits.
+
+TIP: configuração inicial sugerida para as VMs:
+----
+Disco: 20GB
+   particionamento padrão
+RAM:   2GB
+vCPU:  2
+----
+
+* *Balanceador de Carga/Proxy Reverso*
+** `srvhttpd   - 192.168.25.10`
+
+* *Servidor de Aplicação*
+** `srveapdc   - 192.168.25.11`
+** `srveaphc1  - 192.168.25.12`
+** `srveaphc2  - 192.168.25.13`
+
+TIP: para as VMs _Host Controller_ (`hc`) sugiro aumentar a +
+memória disponível no sistema operacional: `4GB` para cada. +
+Dessa forma será possível provisionar um número maior
+de _managed servers_ (instâncias de JBoss) por _Host Controller_.
+
+* *Solução de Monitoramento e Gerência do Ambiente*
+** `srvjon - 192.168.25.20`
+
+TIP: o _JBoss Operations Network_ utiliza um Banco de Dados para persistir os dados
+coletados no ambiente JBoss ao longo do tempo. Por este motivo este servidor necessita de um espaço maior
+no sistema de arquivos. Sugerimos uma partição adicional (`/var`) com `50GB` nesta VM.
+
+=== Endereçamento de Rede
+O seguinte endereçamento de rede será utilizado como referência neste documento.
+
+WARNING: Faça as respectivas substituições de endereços IP ao utilizar os comandos descritos neste documento conforme seu ambiente real.
+
+```
+subnet: 192.168.25.0/24 (255.255.255.0)
+```
+
+==== Endereço IP de cada Host (VM)
+
+WARNING: Neste roteiro faremos referência a cada serviço/host utilizado seu respectivo endereço IP.
+Entretanto em um ambiente real recomenda-se a utilização de um serviço de nomes (DNS) para a adequada identificação de cada host.
+
+----
+srvhttpd	- 192.168.25.10
+srveapdc	- 192.168.25.11
+srveaphc1	- 192.168.25.12
+srveaphc2	- 192.168.25.13
+srvjon		- 192.168.25.20
+----
+
+=== Softwares utilizados
+* Red Hat Enterprise Linux 6.x
+* Apache Httpd Web Server 2.2.x
+* JBoss Enterprise Application Server 6.x
+* JBoss Operations Network 3.x
+* Postgres 9.1
+* OpenJDK 7
+
+== Setup comum a todos os Hosts
+O passos descritos neste tópico devem ser executados em todos os hosts. São
+configurações especificas do ambiente no sistema operacional.
+
+.Registro da VM no RHN.
+Este passo é necessário para que seja possível baixar os pacotes `.rpm` do repositório oficial Red Hat
+----
+rhn_register --proxy=<ip proxy server>:<proxy port>
+----
+
+criação do usuário `jboss`
+----
+adduser jboss
+passwd jboss
+----
+
+TIP: para executar comandos que exigem permissão de `root` utilize
+o mecanismo `sudo` do sistema operacional.
+Adicione o usuário `jboss` na lista de `sudors`
+
+como `root` execute
+----
+> visudo
+----
+
+localize o trecho abaixo
+[source,bash]
+----
+## Allows people in group wheel to run all commands
+#%wheel ALL=(ALL)       ALL
+----
+
+e adicione a seguinte linha abaixo
+[source,bash]
+----
+%jboss ALL=(ALL)       ALL
+----
+
+crie o diretório raiz da instalação.
+----
+mkdir -p /opt/redhat
+chown jboss.jboss /opt/redhat
+----
+
+.Configuração do serviço `ntpd`
+----
+> vim /etc/ntp.conf
+----
+[source,bash]
+----
+# Use public servers from the pool.ntp.org project.
+# Please consider joining the pool (http://www.pool.ntp.org/join.html).
+server <ntp server 1> iburst
+server <ntp server 2> iburst
+#server 0.rhel.pool.ntp.org
+#server 1.rhel.pool.ntp.org
+#server 2.rhel.pool.ntp.org
+----
+
+configure o `ntpd` como serviço no sistema operacional.
+----
+> chkconfig --add ntpd
+> chkconfig ntpd on
+> service ntpd start
+----
+
+desabilite o iptables local
+----
+> /etc/init.d/iptables stop
+> /etc/init.d/ip6tables stop
+> chkconfig iptables off
+> chkconfig ip6tables off
+----
+
+desabilite o SELinux e o IPTables local
+----
+> sudo setenforce 0
+> sudo vim /etc/selinux/config
+----
+[source,bash]
+----
+# This file controls the state of SELinux on the system.
+# SELINUX= can take one of these three values:
+#     enforcing - SELinux security policy is enforced.
+#     permissive - SELinux prints warnings instead of enforcing.
+#     disabled - No SELinux policy is loaded.
+SELINUX=disabled
+----
+
+altere os limites de descritores e processo no sistema operacional
+----
+> vim /etc/security/limits.conf
+----
+[source,bash]
+----
+jboss	-	nproc		9999
+jboss	-	nofile 		9999
+----
+
+.Cópia dos binários de instalação
+após realizar o download dos binários no Red Hat Customer Portal copie os arquivos (zip)
+para um diretório no home do usuário `jboss` recém criado.
+
+a partir de sua estação de trabalho copie os arquivos para o servidor de destino da instalação.
+----
+scp ~/Downloads/.zip jboss@192.168.25.11:~/Downloads
+----
+
+.Instalação do Java
+Instale o openjdk (selecione a versão desejada e disponível no repositório)
+----
+sudo yum install java-1.8.0-openjdk.x86_64 java-1.8.0-openjdk-devel.x86_64
+----
+
+Caso queira manter mais de uma versão do Java utilize o utilitário `alternatives` para configurar a versão padrão no sistema.
+----
+> sudo alternatives --config java
+
+There are 2 programs which provide 'java'.
+
+Selection    Command
+-----------------------------------------------
+*+ 1           /usr/lib/jvm/jre-1.6.0-openjdk.x86_64/bin/java
+2           /usr/lib/jvm/java-1.8.0-openjdk-1.8.0.25-3.b17.el6_6.x86_64/jre/bin/java
+
+Enter to keep the current selection[+], or type selection number: 2
+
+> java -version
+openjdk version "1.8.0_25"
+OpenJDK Runtime Environment (build 1.8.0_25-b17)
+OpenJDK 64-Bit Server VM (build 25.20-b23, mixed mode)
+----
+
+.Variáveis de ambiente
+
+----
+sudo vim /etc/java/java.conf
+
+#remova o comentário (#) das variáveis
+JVM_ROOT
+JAVA_HOME
+----
+
+defina algumas variáveis no shel do usuário `jboss`
+
+----
+> sudo vim ~/.bash_profile
+----
+[source,bash]
+----
+# User specific environment and startup programs
+export JAVA_HOME=/usr/lib/jvm/java
+
+#Alterar o locale do sistema para en_US.UTF-8
+export LANG="en_US.UTF-8"
+export LC_ALL="en_US.UTF-8"
+----
+
+atualize o profile do usuário no shell
+----
+> source ~/.bash_profile
+----
+
+== Apache Httpd (mod_cluster)
+
+TIP: execute os comandos abaixo como usuário `root`.
+
+Instale o pacote httpd
+----
+> yum install httpd httpd-tools
+----
+
+Copie o zip dos conectores nativos do JBoss EAP 6 para RHEL7 (x64).
+
+TIP: o pacote contendo os conectores nativos estão disponíveis na mesma página de download dos binários do EAP 6
+dentro do _Red Hat Customer Portal_.
+
+Após o download extraia o conteúdo do zip em um diretório local.
+----
+> cd /tmp
+> unzip ~/Downloads/jboss-eap-native-webserver-connectors-6.3.0-RHEL6-x86_64.zip
+----
+
+copie as bibliotecas nativas para dentro do diretório `modules` do Apache Httpd
+----
+> cp jboss-eap-6.3/modules/system/layers/base/native/lib64/httpd/modules/* /etc/httpd/modules/
+----
+
+Copie o arquivo de configuração do mod_cluster fornecido como exemplo
+----
+> cp ./jboss-eap-6.3/modules/system/layers/base/native/etc/httpd/conf/mod_cluster.conf /etc/httpd/conf.d/
+----
+
+Altere o módulo MPM do Apache httpd para Worker
+----
+> vim /etc/sysconfig/httpd
+----
+[source,bash]
+----
+#
+# The default processing model (MPM) is the process-based
+# 'prefork' model.  A thread-based model, 'worker', is also
+# available, but does not work with some modules (such as PHP).
+# The service must be stopped before changing this variable.
+#
+HTTPD=/usr/sbin/httpd.worker
+----
+
+Altere o arquivo de configuração do mod_cluster conforme abaixo
+----
+> vim /etc/httpd/conf.d/mod_cluster.conf
+----
+[source]
+----
+<IfModule manager_module>
+
+Listen 6666
+
+<VirtualHost *:6666>
+
+   AllowDisplay On
+   LogLevel debug
+
+   <Directory />
+      Order deny,allow
+      Deny from all
+      Allow from 192.168.25.
+   </Directory>
+
+   ServerAdvertise on
+   EnableMCPMReceive
+
+   <Location /mcm>
+   SetHandler mod_cluster-manager
+   Order deny,allow
+   Deny from all
+   Allow from all
+   </Location>
+
+</VirtualHost>
+
+</IfModule>
+----
+
+Altere o arquivo de configuração do Apache Httpd
+----
+> sudo vim /etc/httpd/conf/httpd.conf
+----
+
+Localize a linha indicada abaixo e comente usando `#`
+[source]
+----
+#LoadModule proxy_balancer_module modules/mod_proxy_balancer.so
+----
+
+Reinicie o serviço httpd
+----
+> service httpd restart
+----
+
+Confira o logo do serviço para confirmar que tudo subiu ok.
+----
+tail -f /etc/httpd/logs/error_log
+[Mon Jan 12 18:48:14 2015] [notice] SELinux policy enabled; httpd running as context unconfined_u:system_r:httpd_t:s0
+[Mon Jan 12 18:48:14 2015] [notice] suEXEC mechanism enabled (wrapper: /usr/sbin/suexec)
+[Mon Jan 12 18:48:14 2015] [warn] httpd version 2.2.15 mismatch detected
+[Mon Jan 12 18:48:14 2015] [notice] Digest: generating secret for digest authentication ...
+[Mon Jan 12 18:48:14 2015] [notice] Digest: done
+[Mon Jan 12 18:48:16 2015] [warn] httpd version 2.2.15 mismatch detected
+[Mon Jan 12 18:48:16 2015] [notice] Advertise initialized for process 8686
+[Mon Jan 12 18:48:16 2015] [notice] Apache/2.2.15 (Unix) DAV/2 mod_cluster/1.2.9.Final configured -- resuming normal operations
+----
+
+O `mod_cluster_manager` pode ser acessado na rede local através da URL `http://192.168.25.10:6666/mcm`
+
+Configure o serviço `httpd` para inicialização automática no sistema operacional.
+----
+chkconfig httpd on
+----
+
+== JBoss EAP _Domain_
+
+=== JBoss EAP - _Domain Controller_
+Neste ambiente utilizei uma versão customizada do script de inicialização diferente do fornecido
+na instalaçao original do EAP (`$JBOSS_HOME/bin/init.d`).
+Esta versão encontra-se disponível em meu repositório público https://github.com/rafaeltuelho/jboss-scripts[rafaeltuelho @ *GitHub*]
+
+Realize o download dos scripts e extraia no home do usuário `jboss`.
+
+NOTE: a versão customizada do script foi criada originalmente pelo https://github.com/rafaelliu/jboss-scripts[Rafael Liu @ *GitHub*] . Porém
+a versão utilizada neste ambiente é um clone da versão original e conta com pequenas atualizações.
+
+Crie os seguintes diretórios utilizados pelo script
+----
+> sudo mkdir -p /var/log/jboss
+> sudo mkdir -p /var/run/jboss
+> sudo chown jboss.jboss /var/run/jboss
+> sudo chown jboss.jboss /var/log/jboss
+----
+
+execute os passos a seguir para configurar os parâmetros no script de inicialização
+----
+> cd /opt/redhat/jboss-eap-6.3/bin/init.d
+> cp ~/Downloads/jboss-scripts/bin/init.d/jboss-custom.sh .
+> chmod +x *.sh
+
+> cd /opt/redhat/jboss-eap-6.3/domain
+> cp -r ~/Downloads/jboss-scripts/domain/bin .
+
+> cd bin
+> chmod +x *.sh
+----
+
+
+Informe o valor das seguintes variáveis no arquivo `setup.conf`
+----
+> vim setup.conf
+----
+[source,bash]
+----
+BIND_ADDRESS="ip do domain controller"
+
+# uncomment if (and only if) it's a remote HC
+#MASTER_ADDRESS="xxx.xxx.xxx.xxx"
+
+# need in order to use service jboss start console
+JBOSS_CONSOLE_LOG="/var/log/jboss/jboss-$DOMAIN_PROFILE-console.log"
+----
+
+adicione o script como serviço no sistema operacional
+----
+> sudo ln -s /opt/redhat/jboss-eap-6.3/domain/bin/jboss-init.sh /etc/init.d/jboss-as
+> sudo chkconfig --add jboss-as
+> sudo chkconfig jboss-as on
+----
+
+.Criação do admin user no JBoss
+----
+> cd $JBOSS_HOME/bin
+./add-user.sh
+
+What type of user do you wish to add?
+ a) Management User (mgmt-users.properties)
+ b) Application User (application-users.properties)
+(a):
+
+Enter the details of the new user to add.
+Using realm 'ManagementRealm' as discovered from the existing property files.
+Username : admin
+The username 'admin' is easy to guess
+Are you sure you want to add user 'admin' yes/no? yes
+Password requirements are listed below. To modify these restrictions edit the add-user.properties configuration file.
+ - The password must not be one of the following restricted values {root, admin, administrator}
+ - The password must contain at least 8 characters, 1 alphabetic character(s), 1 digit(s), 1 non-alphanumeric symbol(s)
+ - The password must be different from the username
+Password : <senha contendo letras, dígitos e caracteres especiais>
+Re-enter Password :
+What groups do you want this user to belong to? (Please enter a comma separated list, or leave blank for none)[  ]:
+About to add user 'admin' for realm 'ManagementRealm'
+Is this correct yes/no? yes
+Added user 'admin' to file '/opt/redhat/jboss-eap-6.3/standalone/configuration/mgmt-users.properties'
+Added user 'admin' to file '/opt/redhat/jboss-eap-6.3/domain/configuration/mgmt-users.properties'
+Added user 'admin' with groups  to file '/opt/redhat/jboss-eap-6.3/standalone/configuration/mgmt-groups.properties'
+Added user 'admin' with groups  to file '/opt/redhat/jboss-eap-6.3/domain/configuration/mgmt-groups.properties'
+Is this new user going to be used for one AS process to connect to another AS process?
+e.g. for a slave host controller connecting to the master or for a Remoting connection for server to server EJB calls.
+yes/no? no
+----
+
+Inicie o JBoss EAP em modo Domain utilizando o serviço configurado no sistema operacional.
+----
+> sudo service jboss-as start
+----
+
+para ver todas as opções disponíveis no script customizado execute:
+----
+> /etc/init.d/jboss-as
+----
+
+
+=== JBoss EAP 6 - _Host Controller_
+Os passos descritos neste tópico devem ser executados em ambos `Host Controllers`:
+`srveaphc1` e `srveaphc2`.
+
+Após o setup do `Domain Controller` copie o diretório de instalação do JBoss EAP para o servidor `srveaphc1`.
+----
+cd /opt/redhat
+scp -r jboss@srveapdc:/opt/redhat/jboss-eap-6.3 .
+----
+
+Altere o arquivo setup.conf conforme abaixo.
+----
+> vim setup.conf
+----
+[source,bash]
+----
+BIND_ADDRESS="ip do host controller"
+
+# uncomment if (and only if) it's a remote HC
+MASTER_ADDRESS="192.168.25.10"
+
+# need in order to use service jboss start console
+JBOSS_CONSOLE_LOG="/var/log/jboss/jboss-$DOMAIN_PROFILE-console.log"
+----
+
+adicione o script como serviço no sistema operacional
+----
+> sudo ln -s /opt/redhat/jboss-eap-6.3/domain/bin/jboss-init.sh /etc/init.d/jboss-as
+> sudo chkconfig --add jboss-as
+> sudo chkconfig jboss-as on
+----
+
+.Criação do _slave user_ no Domínio
+para que o _Host Slave_ se registre no Domínio é necessário criar um usuário de gerência no JBoss EAP.
+
+Abra um novo terminal e acesse o servidor DC via ssh.
+Em seguida crie um usuário com o nome do _host slave_ (`srveaphc1`)
+----
+> ssh jboss@srveapdc
+> cd $JBOSS_HOME/bin
+> ./add-user.sh -u srvarqhc1 -p abcd@1234 -s
+----
+
+Codifique a senha (`abcd@123`) utilizando o comando `base64` no shell
+----
+echo abcd@1234 | base64
+YWJjZEAxMjM0Cg==
+----
+
+Em seguida copie a senha codificada, retorne ao shel do Host Slave (`srveaphc1`) e altere o arquivo `host-slave.xml`
+
+----
+> vim /opt/redhat/jboss-eap-6.3/domain/configuration/host-slave.xml
+----
+
+altere os dois trechos conforme abaixo
+
+[source,xml]
+----
+<?xml version='1.0' encoding='UTF-8'?>
+
+<host xmlns="urn:jboss:domain:1.6">
+
+<management>
+
+...
+
+<security-realm name="ManagementRealm">
+   <server-identities>
+      <!-- Replace this with either a base64 password of your own,
+           or use a vault with a vault expression -->
+      <secret value="YWJjZEAxMjM0Cg=="/> <!--1-->
+   </server-identities>
+
+...
+
+   <domain-controller>
+      <remote host="${jboss.domain.master.address}"
+              port="${jboss.domain.master.port:9999}"
+              security-realm="ManagementRealm" username="srvarqhc1" /> <!--2-->
+   </domain-controller>
+...
+----
+<1> senha utilizada durante o registro do HC no DC remoto
+<2> nome do usuário criado para este HC
+
+TIP: por padrão o aquivo de configuração `host-slave.xml` (utilizado pelos _Hosts Slave_ no modo _Domain_) não inclui a interface de gerência http.
+Essa interface de gerência é utilizada pelo agente do JON para monitorar e controlar um processo _Host Controller Slave_.
+Sem que esta interface esteja habilitada os Slaves não são monitorados pelo JON. Apesar de serem importados no inventário do JON Server,
+aparecem como recurso indisponível (_DOWN_).
+Para solucionar esse problema, aproveite a alteração descrita acima e inclua mais um trecho XML em `host-slave.xml`
+para habilitar tal interface.
+
+[source,xml]
+----
+<?xml version='1.0' encoding='UTF-8'?>
+
+<host xmlns="urn:jboss:domain:1.6">
+
+<management>
+
+...
+
+   <management-interfaces>
+      <native-interface security-realm="ManagementRealm">
+         <socket interface="management" port="${jboss.management.native.port:9999}"/>
+      </native-interface>
+
+      <!--1-->
+      <http-interface security-realm="ManagementRealm">
+         <socket interface="management" port="${jboss.management.http.port:9990}"/>
+      </http-interface>
+
+   </management-interfaces>
+</management>
+...
+----
+<1> Interface de Gerência HTTP
+
+Inicie o Host Slave
+----
+> sudo service jboss-as start
+
+> /etc/init.d/jboss-as tail
+----
+
+retorne ao shell do DC e verifique o log conforme abaixo
+----
+> tail -f /var/log/jboss/jboss-domain-console.log
+[Host Controller] 15:40:25,592 INFO  [org.jboss.as.domain] (Host Controller Service Threads - 27) JBAS010918: Host slave remoto registrado "srveaphc1", JBoss EAP 6.3.2.GA (AS 7.4.2.Final-redhat-2)
+----
+
+NOTE: observe a mensagem acima informando que o Host slave registrou-se com sucesso no DC. Caso não veja tal mensagem reveja a execução dos passos descritos acima.
+
+
+== JBoss Operations Network - _Server_
+
+=== Postgres SQL Server
+Antes de iniciar a instalção do JON é necessário instalar e configurar o servidor de banco de dados que armazenará o inventário do JON.
+Por padrão o JON suporta o Oracle e o Postgres DB. Neste roteiro utilizamos o Postgres 9.1 (versão suportada e homologada).
+Por se tratar de um ambiente de pequeno porte, a instalação do banco de dados será realizada no mesmo Host que hospeda o JON Server.
+
+NOTE: Referências para instalação do Postgres no RHEL 6: +
+  https://wiki.postgresql.org/wiki/YUM_Installation +
+  http://yum.postgresql.org/repopackages.php
+
+Inclua o repositório de pacotes oficial `*postgresql.org*` na configuração do `yum`
+----
+> vim /etc/yum/pluginconf.d/rhnplugin.conf
+----
+[source]
+----
+exclude=postgresql*
+----
+
+instale os pacotes do postgres
+----
+> yum localinstall http://yum.postgresql.org/9.1/redhat/rhel-6-x86_64/pgdg-redhat91-9.1-5.noarch.rpm
+> yum install postgresql91.x86_64 postgresql91-server.x86_64
+----
+
+caso necessite alterar o caminho onde o Postgres grava os dados no sistema de arquivos do Host,
+altere a variavel `PGDATA` para uma partição no disco com maior capacidade.
+----
+> vim /etc/init.d/postgresql-9.1
+----
+
+[source]
+----
+PGDATA=/var/lib/pgsql/9.1/data
+----
+
+Inicialize o Banco de Dados Postgres pela primeira vez
+----
+> /etc/init.d/postgresql-9.1 initdb -D /var/pgsql/9.1/data
+----
+
+adicione o postgres como serviço no sistema operacional
+----
+> chkconfig postgresql-9.1 on
+> service postgresql-9.1 start
+----
+
+.Criação do DB utilizado pelo JON Server
+acesse o shell do usuário `postgres` e execute os seguintes comandos
+
+----
+> su - postgres
+> /usr/pgsql-9.1/bin/psql
+psql (9.1.14)
+Digite "help" para ajuda.
+
+postgres=# ALTER USER postgres PASSWORD 'postgres';
+ALTER ROLE
+postgres=# CREATE USER rhqadmin PASSWORD 'rhqadmin';
+CREATE ROLE
+postgres=# CREATE DATABASE rhq OWNER rhqadmin;
+CREATE DATABASE
+ALTER USER rhqadmin SET statement_timeout=600000;
+ALTER ROLE
+postgres=# \q
+----
+
+Configure o postgres para aceitar conexões locais
+----
+> vim /u01/pgsql/9.1/data/pg_hba.conf
+----
+[source]
+----
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# "local" is for Unix domain socket connections only
+local   all             all                                     md5
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            md5
+# IPv6 local connections:
+host    all             all             ::1/128                 md5
+----
+
+.Tuning do DB para o JON Server
+----
+> vim /u01/pgsql/9.1/data/postgresql.conf
+----
+[source]
+----
+## not necessary  if the database is started with the -i flag
+listen_addresses = '*'
+
+## performance changes for JBoss ON
+shared_buffers = 80MB 		#  default is 32MB
+work_mem = 2048 		#  default is 1MB
+checkpoint_segments = 10	#  default is 3
+max_connections = 60	   #  default is 100
+superuser_reserved_connections = 5 #  default is 3
+max_prepared_transactions = 60     #  default is 0 (in v8.4)
+----
+
+=== JON Server
+Copie os binários de instalção do JON Server juntamento com os plugins para o Host `srvjonserver`.
+
+----
+> scp ~/Downloads/jon*.zip jboss@192.168.25.20:~/Downloads/
+jon-plugin-pack-eap-3.3.0.GA.zip                                                                                                          100%   10MB  10.1MB/s   00:01
+jon-server-3.3.0.GA.zip
+----
+
+Extraia o zip no diretório conforme abaixo
+----
+> cd /opt/redhat
+> unzip ~/Downloads/jon-server-3.3.0.GA.zip
+----
+
+Em seguida altere o script de configuração do ambiente JON conforme trecho abaixo.
+----
+> vim jon-server-3.3.0.GA/bin/rhq-server-env.sh
+----
+[source, bash]
+----
+export RHQ_JAVA_HOME=/usr/lib/jvm/java-1.7.0
+export RHQ_SERVER_HOME=/opt/redhat/jon-server-3.3.0.GA
+----
+
+execute os passos abaixo para preparar o host para instalação
+----
+> sudo mkdir -p /var/rhq-storage/data
+> sudo chown -R jboss.jboss /var/rhq-storage
+cd jon-server-3.3.0.GA/bin/
+> ./rhqctl install --storage-data-root-dir /u01/rhq-storage/data --agent-preference 'name=jonserver-agent'
+----
+
+a instalação do JON é composta por três serviços: `JON Server`, `JON Agent` e o `storage node`.
+ A execução do script `rhqctl` com os parâmetros aicma fará o setup dos três serviços automaticamente.
+----
+10:45:50,075 INFO  [org.jboss.modules] JBoss Modules version 1.3.3.Final-redhat-1
+
+The [rhq.autoinstall.server.admin.password] property is required but not set in [rhq-server.properties].
+Do you want to set [rhq.autoinstall.server.admin.password] value now?
+yes|no: yes
+rhq.autoinstall.server.admin.password (enter as plain text): rhqadmin
+Confirm:
+rhq.autoinstall.server.admin.password (enter as plain text): rhqadmin
+
+The [jboss.bind.address] property is required but not set in [rhq-server.properties].
+Do you want to set [jboss.bind.address] value now?
+yes|no: yes
+jboss.bind.address: 192.168.25.20
+Is [192.168.25.20] correct?
+yes|no: yes
+----
+
+inicie os serviços do JON Server e verifique o status
+----
+> ./rhqctl start
+> ./rhqctl status
+10:51:47,826 INFO  [org.jboss.modules] JBoss Modules version 1.3.3.Final-redhat-1
+RHQ Storage Node               (pid 19044  ) is ✔running
+RHQ Server                     (pid 19256  ) is ✔running
+JBossAS Java VM child process  (pid 19375  ) is ✔running
+RHQ Agent                      (pid 19578  ) is ✔running
+----
+
+==== Instalação dos plugins
+O JON Server realiza o monitoramento dos recursos através de Agentes que
+por sua vez utilizam _plugins_ específicos para cada tipo de recurso que se deseja monitorar e controlar.
+
+Após fazer o download dos plugins e copiar o binário para o Host que hospeda o JON Server,
+extraia o conteúdo em um diretório temporário e em seguida copie o conteúdo do diretório (`*.jar`)
+para dentro de `$JON_SERVER/plugins`
+----
+> unzip ~/Downloads/jon-plugin-pack-eap-3.3.0.GA.zip -d /opt/redhat
+
+> cd /opt/redhat
+> mv jon-plugin-pack-eap-3.3.0.GA/*.jar jon-server-3.3.0.GA/plugins/
+> ll jon-server-3.3.0.GA/plugins/
+
+total 10652
+-rw-rw-r--. 1 jboss jboss   50905 Nov 17 15:36 hornetq-jopr-plugin-2.0.0.Final.jar
+-rw-rw-r--. 1 jboss jboss   11075 Nov 17 15:36 jopr-hibernate-plugin-4.12.0.JON330GA.jar
+-rw-rw-r--. 1 jboss jboss 2470029 Nov 17 15:36 jopr-jboss-as-5-plugin-4.12.0.JON330GA.jar
+-rw-rw-r--. 1 jboss jboss 2469260 Nov 17 15:36 jopr-jboss-as-plugin-4.12.0.JON330GA.jar
+-rw-rw-r--. 1 jboss jboss   26153 Nov 17 15:36 jopr-jboss-cache-plugin-4.12.0.JON330GA.jar
+-rw-rw-r--. 1 jboss jboss   16959 Nov 17 15:36 jopr-jboss-cache-v3-plugin-4.12.0.JON330GA.jar
+-rw-r--r--. 1 jboss jboss    1224 Nov 17 14:35 README.txt
+-rw-rw-r--. 1 jboss jboss  564630 Nov 17 15:36 rhq-apache-plugin-4.12.0.JON330GA.jar
+-rw-rw-r--. 1 jboss jboss 1022225 Nov 17 15:36 rhq-augeas-plugin-4.12.0.JON330GA.jar
+-rw-rw-r--. 1 jboss jboss 2206362 Nov 17 15:36 rhq-jboss-as-7-plugin-4.12.0.JON330GA.jar
+-rw-rw-r--. 1 jboss jboss 1688757 Nov 17 15:36 rhq-rhqserver-plugin-4.12.0.JON330GA.jar
+-rw-rw-r--. 1 jboss jboss   20685 Nov 17 15:36 rhq-serverplugin-wfly-patch-bundle-4.12.0.JON330GA.jar
+----
+
+Após alguns instantes o JON Server fará um _scaning_ no diretório `plugins` e
+fará a instalação automaticamente.
+
+Adicione o JON Server como serviço no sistema operacional
+
+NOTE: o script `$JONSERVER_HOME/bin/rhqctl` fornecido na instalação do produto não está adequado para ser utilizado
+como serviço em sistemas Linux (mecanismo de inicialização `SystemV`).
+Como alternativa a Red Hat oferece um script customizado aos clientes.
+ Esse script encontra-se disponível no _Red Hat Customer Portal_: https://access.redhat.com/solutions/772163
+
+copie o código do script neste https://access.redhat.com/solutions/772163[_kbase_] e
+crie um script shell manualmente.
+----
+> sudo vim /etc/init.d/jboss-on
+----
+
+crie o seguinte arquivo de configuração com as seguintes variáveis
+----
+> sudo vim /etc/jboss-on.conf
+----
+[source,bash]
+----
+RHQ_HOME=/opt/redhat
+RHQ_SERVER_HOME=$RHQ_HOME/jon-server-3.3.0.GA
+RHQ_AGENT_HOME=$RHQ_HOME/rhq-agent
+RHQ_JAVA_HOME=/usr/lib/jvm/java-1.7.0
+RHQ_USER=jboss
+----
+
+configure o JON como serviço no sistema operacional
+----
+> sudo chmod a+x /etc/init.d/jboss-on
+> sudo chkconfig --add jboss-on
+> sudo chkconfig jboss-on on
+----
+
+== JBoss Operations Network - _Agent_
+Além da instalação do JON Server é necessário instalar o agente do JON em cada host que hospeda um serviço Red Hat JBoss.
+ É através desse agente que o JON consegue monitorar e gerenciar as inslações JBoss em seu ambiente.
+
+O binário de instalação do agente pode ser obtido através da console do JON Server.
+ Faça o download do pacote de instalação direto através da URL
+`http://192.168.25.20:7080/agentupdate/download`. Salve o arquivo em  um diretório local
+e execute o seguinte comando `java` no shell para iniciar a instalação do agente no host.
+
+----
+> java -jar ~/Downloads/rhq-enterprise-agent-4.12.0.JON330GA.jar --install
+----
+
+acesse o diretório de instalação para configurar o script de ambiente
+
+----
+> cd rhq-agent/bin
+> vim bin/rhq-agent-env.sh
+----
+
+[source,bash]
+----
+export RHQ_AGENT_HOME="/opt/redhat/rhq-agent"
+export RHQ_JAVA_HOME="/usr/lib/jvm/java-1.7.0"
+RHQ_AGENT_PIDFILE_DIR="/var/run/jboss"
+RHQ_AGENT_START_COMMAND="su -m jboss -c '${RHQ_AGENT_HOME}/bin/rhq-agent.sh'"
+RHQ_AGENT_PASSWORD_PROMPT=true
+----
+
+adicione o agente do JON como serviço no sistema operacional
+----
+> sudo ln -s /opt/redhat/rhq-agent/bin/rhq-agent-wrapper.sh /etc/init.d/jboss-on
+> chkconfig --add jboss-on
+> chkconfig jboss-on on
+----
+
+== Resumo do ambiente pós instalação
+Segue abaixo um sumário com informações úteis de acesso e manipulação dos serviços
+instalados e configurados no ambiente proposto neste roteiro.
+
+.Acesso aos Hosts via SSH
+
+----
+> ssh <user>@<ip do host>
+----
+
+* user: `root`
+* pwd:  `<senha definida na instalação>`
+
+* user: `jboss`
+* pwd:  `<senha definida na instalação>`
+
+.Acesso aos consoles do JBoss
+
+* *EAP*
+** URL: http://192.168.25.11:9990/console
+*** user: `admin`
+*** pwd:  `JBoss!1`
+
+* *Apache Httpd (mod_cluster)*
+** URL: http://192.168.25.10:6666/mcm
+*** sem usuário - console aberto para rede interna
+
+* *JON*
+** URL:  http://192.168.25.20:7080/coregui
+*** user: `rhqadmin`
+*** pwd:  `rhqadmin`
+
+.Inicialização dos serviços instalados
+* *EAP*
+----
+> sudo /etc/init.d/jboss-as start
+----
+
+* *JON Agent* (instalados em todos os hosts)
+----
+> sudo /etc/init.d/jboss-on start
+----
+
+* *Apache Httpd (mod_cluster)*
+----
+> service httpd start
+----
+
+* *JON*
+----
+> sudo /etc/init.d/jboss-on start
+----
+
+.Arquivos de Log dos serviços instalados
+
+* *EAP*
+através do script do serviço
+----
+> sudo /etc/init.d/jboss-as tail <nome do managed server>
+----
+
+via comando tail
+
+** _Host Controller_
+----
+tail -f /var/log/jboss/<nome do arquivo>
+----
+** _Managed Server_
+----
+tail -f /opt/redhat/jboss-eap-6.3/domain/servers/<nome do server>/logs/server.log
+----
+
+* *JON Server*
+----
+tail -f /opt/redhat/jon-server/logs/server.log
+----
+
+* *JON Agent* (instalado em todos os hosts)
+----
+tail -f /opt/redhat/rhq-agent/logs/agent.log
+----
+
+* *Apache Httpd (mod_cluster)*
+----
+tail -f /etc/httpd/logs/<nome do arquivo>
+----
