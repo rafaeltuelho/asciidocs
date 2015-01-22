@@ -1,5 +1,5 @@
 ﻿= Implementando um ambiente Red Hat JBoss EAP 6 (Domain Mode) com Monitoramento e Gerência (JBoss ON)
-Doc Writter <rsoares@redhat.com>
+Rafael T. C. Soares <rsoares@redhat.com>
 v1.0, 19/01/2015
 :toc: right
 :source-highlighter: pygments
