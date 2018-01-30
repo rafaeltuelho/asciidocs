@@ -700,6 +700,11 @@ superuser_reserved_connections = 5 #  default is 3
 max_prepared_transactions = 60     #  default is 0 (in v8.4)
 ----
 
+Reiniciar o servidor do Postgres:
+----
+> service postgresql-9.1 restart
+----
+
 === JON Server
 Copie os binários de instalção do JON Server juntamento com os plugins para o Host `srvjonserver`.
 
